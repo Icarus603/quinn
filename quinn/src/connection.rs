@@ -644,6 +644,20 @@ impl Connection {
         conn.wake();
     }
 
+    /// Update this connection's local packet- and time-threshold loss
+    /// detection without rebuilding the QUIC carrier.
+    ///
+    /// The values affect only packets sent by this endpoint. Callers should
+    /// retain the same lower bounds as
+    /// [`proto::TransportConfig::packet_threshold`] and
+    /// [`proto::TransportConfig::time_threshold`]: 3 packets and 9/8 RTT.
+    pub fn set_loss_detection_thresholds(&self, packet_threshold: u32, time_threshold: f32) {
+        let mut conn = self.0.state.lock("set_loss_detection_thresholds");
+        conn.inner
+            .set_loss_detection_thresholds(packet_threshold, time_threshold);
+        conn.wake();
+    }
+
     /// Modify the number of remotely initiated bidirectional streams that may be concurrently open
     ///
     /// No streams may be opened by the peer unless fewer than `count` are already open. Large

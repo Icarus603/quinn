@@ -1765,6 +1765,67 @@ fn late_ack_attributes_packet_threshold_spurious_loss() {
 }
 
 #[test]
+fn runtime_loss_threshold_update_changes_existing_connection_recovery() {
+    let _guard = subscribe();
+    let mut pair = Pair::default_with_deterministic_pns();
+    let (client_ch, _server_ch) = pair.connect();
+    pair.client_conn_mut(client_ch)
+        .set_loss_detection_thresholds(10, 1.125);
+
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, stream)
+        .write(&vec![0x5a; DEFAULT_MTU * 8])
+        .unwrap();
+    pair.client.drive(pair.time, pair.server.addr);
+    assert!(pair.client.outbound.len() >= 4);
+    let (_, delayed) = pair.client.outbound.pop_front().unwrap();
+    while let Some((_, packet)) = pair.client.outbound.pop_front() {
+        pair.server
+            .inbound
+            .push_back((pair.time, None, packet.as_ref().into()));
+    }
+    pair.drive_server();
+    pair.drive_client();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .path
+            .packet_threshold_lost_packets,
+        0,
+        "the tolerant runtime threshold must keep the delayed packet outstanding"
+    );
+
+    pair.client_conn_mut(client_ch)
+        .set_loss_detection_thresholds(3, 1.125);
+    pair.client_send(client_ch, stream)
+        .write(&vec![0xa5; DEFAULT_MTU * 4])
+        .unwrap();
+    pair.client.drive(pair.time, pair.server.addr);
+    while let Some((_, packet)) = pair.client.outbound.pop_front() {
+        pair.server
+            .inbound
+            .push_back((pair.time, None, packet.as_ref().into()));
+    }
+    pair.drive_server();
+    pair.drive_client();
+    assert!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .path
+            .packet_threshold_lost_packets
+            > 0,
+        "lowering the threshold must take effect on the existing connection"
+    );
+
+    // Preserve the delayed datagram until after the assertion so the test
+    // continues to model reordering rather than actual loss.
+    pair.server
+        .inbound
+        .push_back((pair.time, None, delayed.as_ref().into()));
+    pair.drive();
+}
+
+#[test]
 fn stop_before_finish() {
     let _guard = subscribe();
     let mut pair = Pair::default();

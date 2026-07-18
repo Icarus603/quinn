@@ -133,6 +133,12 @@ use timer::{Timer, TimerTable};
 pub struct Connection {
     endpoint_config: Arc<EndpointConfig>,
     config: Arc<TransportConfig>,
+    /// Runtime packet-number reordering tolerance. Initialized from
+    /// `config`, but independently mutable for path-adaptive recovery.
+    packet_threshold: u32,
+    /// Runtime time-based reordering tolerance. Initialized from
+    /// `config`, but independently mutable for path-adaptive recovery.
+    time_threshold: f32,
     rng: StdRng,
     crypto: Box<dyn crypto::Session>,
     /// The CID we initially chose, for use during the handshake
@@ -273,6 +279,8 @@ impl Connection {
         let mut rng = StdRng::from_seed(rng_seed);
         let mut this = Self {
             endpoint_config,
+            packet_threshold: config.packet_threshold,
+            time_threshold: config.time_threshold,
             crypto,
             handshake_cid: loc_cid,
             rem_handshake_cid: rem_cid,
@@ -1429,6 +1437,20 @@ impl Connection {
         }
     }
 
+    /// Update this connection's local packet- and time-threshold loss
+    /// detection without rebuilding the QUIC carrier.
+    ///
+    /// The values affect only packets sent by this endpoint. As with
+    /// [`TransportConfig::packet_threshold`] and
+    /// [`TransportConfig::time_threshold`], callers are responsible for
+    /// keeping the packet threshold at least 3 and the time threshold at
+    /// least 9/8. The next ACK or loss timer evaluates outstanding packets
+    /// using the new values.
+    pub fn set_loss_detection_thresholds(&mut self, packet_threshold: u32, time_threshold: f32) {
+        self.packet_threshold = packet_threshold;
+        self.time_threshold = time_threshold;
+    }
+
     fn on_ack_received(
         &mut self,
         now: Instant,
@@ -1671,10 +1693,10 @@ impl Connection {
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
         let rtt = self.path.rtt.conservative();
-        let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+        let loss_delay = cmp::max(rtt.mul_f32(self.time_threshold), TIMER_GRANULARITY);
 
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
-        let packet_threshold = self.config.packet_threshold as u64;
+        let packet_threshold = self.packet_threshold as u64;
         let mut size_of_lost_packets = 0u64;
         let mut packet_threshold_lost_packets = 0u64;
         let mut time_threshold_lost_packets = 0u64;
