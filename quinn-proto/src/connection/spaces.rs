@@ -518,34 +518,30 @@ impl ThinRetransmits {
 
 /// RFC4303-style sliding window packet number deduplicator.
 ///
-/// A contiguous bitfield, where each bit corresponds to a packet number and the rightmost bit is
-/// always set. A set bit represents a packet that has been successfully authenticated. Bits left of
-/// the window are assumed to be set.
-///
-/// ```text
-/// ...xxxxxxxxx 1 0
-///     ^        ^ ^
-/// window highest next
-/// ```
+/// A fixed-size ring bitmap tracks authenticated packet numbers. A packet older
+/// than the window is conservatively treated as a duplicate. The 16K-packet
+/// bound tolerates high-bandwidth paths where a short delay spike can reorder
+/// thousands of packets, while keeping replay state fixed at 2 KiB per packet
+/// number space.
 pub(super) struct Dedup {
-    window: Window,
+    window: Box<[WindowWord; WINDOW_WORDS]>,
     /// Lowest packet number higher than all yet authenticated.
     next: u64,
 }
 
-/// Inner bitfield type.
-///
-/// Because QUIC never reuses packet numbers, this only needs to be large enough to deal with
-/// packets that are reordered but still delivered in a timely manner.
-type Window = u128;
-
 /// Number of packets tracked by `Dedup`.
-const WINDOW_SIZE: u64 = 1 + mem::size_of::<Window>() as u64 * 8;
+const WINDOW_SIZE: u64 = 16_384;
+type WindowWord = u64;
+const WINDOW_WORD_BITS: u64 = WindowWord::BITS as u64;
+const WINDOW_WORDS: usize = (WINDOW_SIZE / WINDOW_WORD_BITS) as usize;
 
 impl Dedup {
     /// Construct an empty window positioned at the start.
     pub(super) fn new() -> Self {
-        Self { window: 0, next: 0 }
+        Self {
+            window: Box::new([0; WINDOW_WORDS]),
+            next: 0,
+        }
     }
 
     /// Highest packet number authenticated.
@@ -557,29 +553,53 @@ impl Dedup {
     ///
     /// Returns whether the packet might be a duplicate.
     pub(super) fn insert(&mut self, packet: u64) -> bool {
-        if let Some(diff) = packet.checked_sub(self.next) {
-            // Right of window
-            self.window = ((self.window << 1) | 1)
-                .checked_shl(cmp::min(diff, u64::from(u32::MAX)) as u32)
-                .unwrap_or(0);
+        if packet >= self.next {
+            let advance = packet - self.next + 1;
+            if advance >= WINDOW_SIZE {
+                self.window.fill(0);
+            } else {
+                for newly_exposed in self.next..=packet {
+                    self.clear(newly_exposed);
+                }
+            }
+            self.set(packet);
             self.next = packet + 1;
             false
         } else if self.highest() - packet < WINDOW_SIZE {
-            // Within window
-            if let Some(bit) = (self.highest() - packet).checked_sub(1) {
-                // < highest
-                let mask = 1 << bit;
-                let duplicate = self.window & mask != 0;
-                self.window |= mask;
-                duplicate
-            } else {
-                // == highest
-                true
-            }
+            let duplicate = self.contains(packet);
+            self.set(packet);
+            duplicate
         } else {
-            // Left of window
+            // Left of the bounded replay window.
             true
         }
+    }
+
+    fn position(packet: u64) -> (usize, u32) {
+        let bit = packet % WINDOW_SIZE;
+        (
+            (bit / WINDOW_WORD_BITS) as usize,
+            (bit % WINDOW_WORD_BITS) as u32,
+        )
+    }
+
+    fn contains(&self, packet: u64) -> bool {
+        let (word, bit) = Self::position(packet);
+        self.window[word] & (1 << bit) != 0
+    }
+
+    fn set(&mut self, packet: u64) {
+        let (word, bit) = Self::position(packet);
+        self.window[word] |= 1 << bit;
+    }
+
+    fn clear(&mut self, packet: u64) {
+        let (word, bit) = Self::position(packet);
+        self.window[word] &= !(1 << bit);
+    }
+
+    fn received_or_too_old(&self, packet: u64) -> bool {
+        self.highest().saturating_sub(packet) >= WINDOW_SIZE || self.contains(packet)
     }
 
     /// Returns the packet number of the smallest packet missing between the provided interval
@@ -588,51 +608,17 @@ impl Dedup {
     fn smallest_missing_in_interval(&self, lower_bound: u64, upper_bound: u64) -> Option<u64> {
         debug_assert!(lower_bound <= upper_bound);
         debug_assert!(upper_bound <= self.highest());
-        const BITFIELD_SIZE: u64 = (mem::size_of::<Window>() * 8) as u64;
-
-        // Since we already know the packets at the boundaries have been received, we only need to
-        // check those in between them (this removes the necessity of extra logic to deal with the
-        // highest packet, which is stored outside the bitfield)
-        let lower_bound = lower_bound + 1;
+        let lower_bound = lower_bound.saturating_add(1);
         let upper_bound = upper_bound.saturating_sub(1);
-
-        // Note: the offsets are counted from the right
-        // The highest packet is not included in the bitfield, so we subtract 1 to account for that
-        let start_offset = (self.highest() - upper_bound).max(1) - 1;
-        if start_offset >= BITFIELD_SIZE {
-            // The start offset is outside of the window. All packets outside of the window are
-            // considered to be received.
+        if lower_bound > upper_bound {
             return None;
         }
 
-        let end_offset_exclusive = self.highest().saturating_sub(lower_bound);
-
-        // The range is clamped at the edge of the window, because any earlier packets are
-        // considered to be received
-        let range_len = end_offset_exclusive
-            .saturating_sub(start_offset)
-            .min(BITFIELD_SIZE);
-        if range_len == 0 {
-            return None;
-        }
-
-        // Ensure the shift is within bounds (we already know start_offset < BITFIELD_SIZE,
-        // because of the early return)
-        let mask = if range_len == BITFIELD_SIZE {
-            u128::MAX
-        } else {
-            ((1u128 << range_len) - 1) << start_offset
-        };
-        let gaps = !self.window & mask;
-
-        let smallest_missing_offset = 128 - gaps.leading_zeros() as u64;
-        let smallest_missing_packet = self.highest() - smallest_missing_offset;
-
-        if smallest_missing_packet <= upper_bound {
-            Some(smallest_missing_packet)
-        } else {
-            None
-        }
+        // Packets left of the bounded replay window are intentionally treated
+        // as received. Start at the first packet whose presence we still know.
+        let tracked_from = self.highest().saturating_sub(WINDOW_SIZE - 1);
+        (cmp::max(lower_bound, tracked_from)..=upper_bound)
+            .find(|&packet| !self.received_or_too_old(packet))
     }
 
     /// Returns true if there are any missing packets between the provided interval
@@ -987,32 +973,26 @@ mod test {
         let mut dedup = Dedup::new();
         assert!(!dedup.insert(0));
         assert_eq!(dedup.next, 1);
-        assert_eq!(dedup.window, 0b1);
         assert!(dedup.insert(0));
         assert_eq!(dedup.next, 1);
-        assert_eq!(dedup.window, 0b1);
         assert!(!dedup.insert(1));
         assert_eq!(dedup.next, 2);
-        assert_eq!(dedup.window, 0b11);
         assert!(!dedup.insert(2));
         assert_eq!(dedup.next, 3);
-        assert_eq!(dedup.window, 0b111);
         assert!(!dedup.insert(4));
         assert_eq!(dedup.next, 5);
-        assert_eq!(dedup.window, 0b11110);
         assert!(!dedup.insert(7));
         assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_0100);
         assert!(dedup.insert(4));
         assert!(!dedup.insert(3));
         assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_1100);
         assert!(!dedup.insert(6));
         assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_1101);
         assert!(!dedup.insert(5));
         assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_1111);
+        for packet in 0..=7 {
+            assert!(dedup.insert(packet));
+        }
     }
 
     #[test]
@@ -1020,10 +1000,14 @@ mod test {
         let mut dedup = Dedup::new();
         for i in 0..(2 * WINDOW_SIZE) {
             assert!(!dedup.insert(i));
-            for j in 0..=i {
+            for j in i.saturating_sub(256)..=i {
                 assert!(dedup.insert(j));
             }
         }
+        assert!(
+            dedup.insert(0),
+            "packets older than the bounded window must fail closed"
+        );
     }
 
     #[test]
@@ -1032,10 +1016,18 @@ mod test {
         dedup.insert(2 * WINDOW_SIZE);
         assert!(dedup.insert(WINDOW_SIZE));
         assert_eq!(dedup.next, 2 * WINDOW_SIZE + 1);
-        assert_eq!(dedup.window, 0);
         assert!(!dedup.insert(WINDOW_SIZE + 1));
         assert_eq!(dedup.next, 2 * WINDOW_SIZE + 1);
-        assert_eq!(dedup.window, 1 << (WINDOW_SIZE - 2));
+        assert!(dedup.insert(WINDOW_SIZE + 1));
+    }
+
+    #[test]
+    fn accepts_severe_reordering_inside_bounded_window() {
+        let mut dedup = Dedup::new();
+        assert!(!dedup.insert(WINDOW_SIZE));
+        assert!(!dedup.insert(2));
+        assert!(dedup.insert(2));
+        assert!(dedup.insert(0), "packet outside the bound must fail closed");
     }
 
     #[test]
@@ -1063,16 +1055,16 @@ mod test {
     fn dedup_outside_of_window_has_missing() {
         let mut dedup = Dedup::new();
 
-        for i in 0..140 {
+        for i in 0..WINDOW_SIZE + 11 {
             dedup.insert(i);
         }
 
         // 0 and 4 are outside of the window
         assert!(!dedup.missing_in_interval(0, 4));
-        dedup.insert(160);
+        dedup.insert(WINDOW_SIZE + 31);
         assert!(!dedup.missing_in_interval(0, 4));
-        assert!(!dedup.missing_in_interval(0, 140));
-        assert!(dedup.missing_in_interval(0, 160));
+        assert!(!dedup.missing_in_interval(0, WINDOW_SIZE + 11));
+        assert!(dedup.missing_in_interval(0, WINDOW_SIZE + 31));
     }
 
     #[test]
@@ -1093,15 +1085,21 @@ mod test {
         dedup.insert(2);
         assert_eq!(dedup.smallest_missing_in_interval(1, 7), Some(3));
 
-        dedup.insert(170);
-        dedup.insert(172);
-        dedup.insert(300);
-        assert_eq!(dedup.smallest_missing_in_interval(170, 172), None);
+        let base = WINDOW_SIZE + 42;
+        dedup.insert(base);
+        dedup.insert(base + 2);
+        dedup.insert(base + 130);
+        assert_eq!(
+            dedup.smallest_missing_in_interval(base, base + 2),
+            Some(base + 1)
+        );
 
-        dedup.insert(500);
-        assert_eq!(dedup.smallest_missing_in_interval(0, 500), Some(372));
-        assert_eq!(dedup.smallest_missing_in_interval(0, 373), Some(372));
-        assert_eq!(dedup.smallest_missing_in_interval(0, 372), None);
+        dedup.insert(base + WINDOW_SIZE);
+        let tracked_from = base + 1;
+        assert_eq!(
+            dedup.smallest_missing_in_interval(0, base + WINDOW_SIZE),
+            Some(tracked_from)
+        );
     }
 
     #[test]
