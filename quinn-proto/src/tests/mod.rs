@@ -1710,6 +1710,61 @@ fn handshake_1rtt_handling() {
 }
 
 #[test]
+fn late_ack_attributes_packet_threshold_spurious_loss() {
+    let _guard = subscribe();
+    let mut pair = Pair::default_with_deterministic_pns();
+    let (client_ch, server_ch) = pair.connect();
+
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, stream)
+        .write(&vec![0x5a; DEFAULT_MTU * 8])
+        .unwrap();
+
+    // Poll the client without using Pair::drive_client so the test can
+    // retain the first packet while delivering all later packets.
+    pair.client.drive(pair.time, pair.server.addr);
+    assert!(
+        pair.client.outbound.len() >= 4,
+        "payload must span enough packets to cross the packet threshold"
+    );
+    let (_, delayed) = pair.client.outbound.pop_front().unwrap();
+    while let Some((_, packet)) = pair.client.outbound.pop_front() {
+        pair.server
+            .inbound
+            .push_back((pair.time, None, packet.as_ref().into()));
+    }
+
+    // Deliver later packets and their ACK. The missing first packet is
+    // declared lost by packet number, then retransmitted.
+    pair.drive_server();
+    pair.drive_client();
+    let after_loss = pair.client_conn_mut(client_ch).stats().path;
+    assert!(after_loss.packet_threshold_lost_packets > 0);
+    assert_eq!(after_loss.time_threshold_lost_packets, 0);
+    assert_eq!(after_loss.spurious_lost_packets, 0);
+
+    // The original packet was delayed, not dropped. Delivering it now
+    // produces an ACK for a packet no longer present in sent_packets,
+    // exercising the late-ACK path that used to discard this evidence.
+    pair.server
+        .inbound
+        .push_back((pair.time, None, delayed.as_ref().into()));
+    pair.drive();
+
+    let final_stats = pair.client_conn_mut(client_ch).stats().path;
+    assert!(final_stats.spurious_packet_threshold_lost_packets > 0);
+    assert_eq!(final_stats.spurious_time_threshold_lost_packets, 0);
+    assert_eq!(
+        final_stats.spurious_lost_packets,
+        final_stats.spurious_packet_threshold_lost_packets
+    );
+
+    // The retransmission still delivered the complete application data.
+    let received = stream_chunks(pair.server_recv(server_ch, stream));
+    assert_eq!(received, vec![0x5a; DEFAULT_MTU * 8]);
+}
+
+#[test]
 fn stop_before_finish() {
     let _guard = subscribe();
     let mut pair = Pair::default();

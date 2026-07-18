@@ -2,7 +2,7 @@ use std::{
     cmp,
     collections::{BTreeMap, VecDeque},
     mem,
-    ops::{Bound, Index, IndexMut},
+    ops::{Bound, Index, IndexMut, Range},
 };
 
 use rand::{Rng, RngExt};
@@ -14,6 +14,90 @@ use crate::{
     Dir, Duration, Instant, SocketAddr, StreamId, TransportError, VarInt, connection::StreamsState,
     crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet, shared::IssuedCid,
 };
+
+/// Keep enough packet-number history to diagnose severe reordering without
+/// allowing a lossy peer to grow connection state without bound.
+const SPURIOUS_LOSS_TRACKING_WINDOW: u64 = 65_536;
+
+#[derive(Debug, Default)]
+pub(super) struct LossHistory {
+    packet_threshold: ArrayRangeSet,
+    time_threshold: ArrayRangeSet,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct SpuriousLoss {
+    pub(super) packet_threshold: u64,
+    pub(super) time_threshold: u64,
+}
+
+impl LossHistory {
+    pub(super) fn record_packet_threshold(&mut self, packet: u64) {
+        self.prune_before(packet);
+        self.packet_threshold.insert_one(packet);
+    }
+
+    pub(super) fn record_time_threshold(&mut self, packet: u64) {
+        self.prune_before(packet);
+        self.time_threshold.insert_one(packet);
+    }
+
+    pub(super) fn take_acknowledged(
+        &mut self,
+        acknowledged: &ArrayRangeSet,
+        largest_acked: u64,
+    ) -> SpuriousLoss {
+        let packet_threshold = take_intersection(&mut self.packet_threshold, acknowledged);
+        let time_threshold = take_intersection(&mut self.time_threshold, acknowledged);
+
+        let retain_from = largest_acked.saturating_sub(SPURIOUS_LOSS_TRACKING_WINDOW);
+        self.packet_threshold.remove(0..retain_from);
+        self.time_threshold.remove(0..retain_from);
+
+        SpuriousLoss {
+            packet_threshold,
+            time_threshold,
+        }
+    }
+
+    fn prune_before(&mut self, packet: u64) {
+        let retain_from = packet.saturating_sub(SPURIOUS_LOSS_TRACKING_WINDOW);
+        self.packet_threshold.remove(0..retain_from);
+        self.time_threshold.remove(0..retain_from);
+    }
+}
+
+fn take_intersection(history: &mut ArrayRangeSet, acknowledged: &ArrayRangeSet) -> u64 {
+    let mut overlap = ArrayRangeSet::new();
+    let mut history_ranges = history.iter();
+    let mut acknowledged_ranges = acknowledged.iter();
+    let mut history_range = history_ranges.next();
+    let mut acknowledged_range = acknowledged_ranges.next();
+
+    while let (Some(h), Some(a)) = (&history_range, &acknowledged_range) {
+        let intersection = Range {
+            start: cmp::max(a.start, h.start),
+            end: cmp::min(a.end, h.end),
+        };
+        if !intersection.is_empty() {
+            overlap.insert(intersection);
+        }
+
+        let history_end = h.end;
+        let acknowledged_end = a.end;
+        if history_end <= acknowledged_end {
+            history_range = history_ranges.next();
+        }
+        if acknowledged_end <= history_end {
+            acknowledged_range = acknowledged_ranges.next();
+        }
+    }
+    drop(history_ranges);
+    drop(acknowledged_ranges);
+    let count = overlap.iter().map(|range| range.end - range.start).sum();
+    history.subtract(&overlap);
+    count
+}
 
 pub(super) struct PacketSpace {
     pub(super) crypto: Option<Keys>,
@@ -39,6 +123,9 @@ pub(super) struct PacketSpace {
     /// Transmitted but not acked
     // We use a BTreeMap here so we can efficiently query by range on ACK and for loss detection
     pub(super) sent_packets: BTreeMap<u64, SentPacket>,
+    /// Recently declared losses retained so a later ACK can identify
+    /// spurious packet- or time-threshold loss declarations.
+    pub(super) loss_history: LossHistory,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -84,6 +171,7 @@ impl PacketSpace {
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
             sent_packets: BTreeMap::new(),
+            loss_history: LossHistory::default(),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
 
@@ -1084,5 +1172,65 @@ mod test {
         // The tracking state of sent packets should be minimal, and not grow
         // over time.
         assert!(std::mem::size_of::<SentPacket>() <= 128);
+    }
+
+    #[test]
+    fn loss_history_attributes_spurious_ack_by_trigger_once() {
+        let mut history = LossHistory::default();
+        history.record_packet_threshold(10);
+        history.record_packet_threshold(11);
+        history.record_time_threshold(20);
+
+        let mut acknowledged = ArrayRangeSet::new();
+        acknowledged.insert(9..12);
+        acknowledged.insert(20..21);
+
+        assert_eq!(
+            history.take_acknowledged(&acknowledged, 20),
+            SpuriousLoss {
+                packet_threshold: 2,
+                time_threshold: 1,
+            }
+        );
+        assert_eq!(
+            history.take_acknowledged(&acknowledged, 20),
+            SpuriousLoss::default(),
+            "a repeated ACK must not double-count a spurious declaration"
+        );
+    }
+
+    #[test]
+    fn loss_history_prunes_packets_outside_bounded_window() {
+        let mut history = LossHistory::default();
+        history.record_packet_threshold(1);
+        history.record_time_threshold(SPURIOUS_LOSS_TRACKING_WINDOW + 2);
+        assert!(
+            !history.packet_threshold.contains(1),
+            "recording new loss must enforce the bound even before another ACK"
+        );
+
+        let acknowledged = ArrayRangeSet::new();
+        assert_eq!(
+            history.take_acknowledged(&acknowledged, SPURIOUS_LOSS_TRACKING_WINDOW + 2),
+            SpuriousLoss::default()
+        );
+
+        let mut stale_ack = ArrayRangeSet::new();
+        stale_ack.insert(1..2);
+        assert_eq!(
+            history.take_acknowledged(&stale_ack, SPURIOUS_LOSS_TRACKING_WINDOW + 2),
+            SpuriousLoss::default(),
+            "loss history older than the fixed packet window must be discarded"
+        );
+
+        let mut fresh_ack = ArrayRangeSet::new();
+        fresh_ack.insert(SPURIOUS_LOSS_TRACKING_WINDOW + 2..SPURIOUS_LOSS_TRACKING_WINDOW + 3);
+        assert_eq!(
+            history.take_acknowledged(&fresh_ack, SPURIOUS_LOSS_TRACKING_WINDOW + 2),
+            SpuriousLoss {
+                packet_threshold: 0,
+                time_threshold: 1,
+            }
+        );
     }
 }

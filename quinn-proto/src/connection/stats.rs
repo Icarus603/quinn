@@ -144,6 +144,16 @@ pub struct PathStats {
     pub lost_packets: u64,
     /// The amount of bytes lost on this path
     pub lost_bytes: u64,
+    /// Packets declared lost because they exceeded the packet-number reordering threshold
+    pub packet_threshold_lost_packets: u64,
+    /// Packets declared lost because they exceeded the time-based reordering threshold
+    pub time_threshold_lost_packets: u64,
+    /// Packets declared lost that were subsequently acknowledged
+    pub spurious_lost_packets: u64,
+    /// Packet-threshold losses that were subsequently acknowledged
+    pub spurious_packet_threshold_lost_packets: u64,
+    /// Time-threshold losses that were subsequently acknowledged
+    pub spurious_time_threshold_lost_packets: u64,
     /// The amount of packets sent on this path
     pub sent_packets: u64,
     /// The amount of PLPMTUD probe packets sent on this path (also counted by `sent_packets`)

@@ -1456,12 +1456,22 @@ impl Connection {
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
+        let mut acknowledged = ArrayRangeSet::new();
         for range in ack.iter() {
             self.packet_number_filter.check_ack(space, range.clone())?;
+            acknowledged.insert(*range.start()..*range.end() + 1);
             for (&pn, _) in self.spaces[space].sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
         }
+
+        let spurious = self.spaces[space]
+            .loss_history
+            .take_acknowledged(&acknowledged, ack.largest);
+        self.stats.path.spurious_packet_threshold_lost_packets += spurious.packet_threshold;
+        self.stats.path.spurious_time_threshold_lost_packets += spurious.time_threshold;
+        self.stats.path.spurious_lost_packets +=
+            spurious.packet_threshold + spurious.time_threshold;
 
         if newly_acked.is_empty() {
             return Ok(());
@@ -1666,6 +1676,8 @@ impl Connection {
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
         let mut size_of_lost_packets = 0u64;
+        let mut packet_threshold_lost_packets = 0u64;
+        let mut time_threshold_lost_packets = 0u64;
 
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
@@ -1697,6 +1709,13 @@ impl Connection {
                 } else {
                     lost_packets.push(packet);
                     size_of_lost_packets += info.size as u64;
+                    if packet_too_old {
+                        space.loss_history.record_time_threshold(packet);
+                        time_threshold_lost_packets += 1;
+                    } else {
+                        space.loss_history.record_packet_threshold(packet);
+                        packet_threshold_lost_packets += 1;
+                    }
                     if info.ack_eliciting && due_to_ack {
                         match persistent_congestion_start {
                             // Two ACK-eliciting packets lost more than congestion_period apart, with no
@@ -1735,6 +1754,8 @@ impl Connection {
             let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
+            self.stats.path.packet_threshold_lost_packets += packet_threshold_lost_packets;
+            self.stats.path.time_threshold_lost_packets += time_threshold_lost_packets;
             trace!(
                 "packets lost: {:?}, bytes lost: {}",
                 lost_packets, size_of_lost_packets
