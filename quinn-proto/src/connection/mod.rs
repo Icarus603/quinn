@@ -142,6 +142,8 @@ pub struct Connection {
     /// Runtime time-based reordering tolerance. Initialized from
     /// `config`, but independently mutable for path-adaptive recovery.
     time_threshold: f32,
+    /// Upper bound for confirmed-spurious time-threshold adaptation.
+    adaptive_time_threshold_max: Option<f32>,
     rng: StdRng,
     crypto: Box<dyn crypto::Session>,
     /// The CID we initially chose, for use during the handshake
@@ -285,6 +287,7 @@ impl Connection {
             packet_threshold: config.packet_threshold,
             adaptive_packet_threshold_max: None,
             time_threshold: config.time_threshold,
+            adaptive_time_threshold_max: None,
             crypto,
             handshake_cid: loc_cid,
             rem_handshake_cid: rem_cid,
@@ -1278,6 +1281,7 @@ impl Connection {
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
         stats.path.current_packet_threshold = self.packet_threshold;
+        stats.path.current_time_threshold = self.time_threshold;
 
         stats
     }
@@ -1467,12 +1471,27 @@ impl Connection {
     pub fn enable_adaptive_packet_reordering(&mut self, max_packet_threshold: u32) {
         assert!((3..=16_384).contains(&max_packet_threshold));
         self.adaptive_packet_threshold_max = Some(max_packet_threshold);
+        self.adaptive_time_threshold_max = None;
     }
 
-    /// Stop adapting the packet-number threshold. The current thresholds are
-    /// preserved until explicitly changed.
+    /// Enable bounded packet- and time-threshold adaptation driven only by
+    /// confirmed spurious-loss evidence.
+    pub fn enable_adaptive_reordering(
+        &mut self,
+        max_packet_threshold: u32,
+        max_time_threshold: f32,
+    ) {
+        assert!((3..=16_384).contains(&max_packet_threshold));
+        assert!(max_time_threshold.is_finite() && max_time_threshold >= 1.125);
+        self.adaptive_packet_threshold_max = Some(max_packet_threshold);
+        self.adaptive_time_threshold_max = Some(max_time_threshold);
+    }
+
+    /// Stop adapting packet- and time-based loss thresholds. The current
+    /// thresholds are preserved until explicitly changed.
     pub fn disable_adaptive_packet_reordering(&mut self) {
         self.adaptive_packet_threshold_max = None;
+        self.adaptive_time_threshold_max = None;
     }
 
     fn on_ack_received(
@@ -1511,9 +1530,10 @@ impl Connection {
             }
         }
 
-        let spurious = self.spaces[space]
-            .loss_history
-            .take_acknowledged(&acknowledged, ack.largest);
+        let spurious =
+            self.spaces[space]
+                .loss_history
+                .take_acknowledged(&acknowledged, ack.largest, now);
         self.stats.path.spurious_packet_threshold_lost_packets += spurious.packet_threshold;
         self.stats.path.spurious_time_threshold_lost_packets += spurious.time_threshold;
         self.stats.path.spurious_lost_packets +=
@@ -1523,6 +1543,14 @@ impl Connection {
             .path
             .max_spurious_packet_reordering
             .max(spurious.max_packet_reordering);
+        let conservative_rtt = self.path.rtt.conservative();
+        let time_ratio = if conservative_rtt.is_zero() {
+            0.0
+        } else {
+            (spurious.max_time_loss_age.as_secs_f64() / conservative_rtt.as_secs_f64()) as f32
+        };
+        self.stats.path.max_spurious_time_ratio =
+            self.stats.path.max_spurious_time_ratio.max(time_ratio);
         if spurious.packet_threshold != 0 {
             if let Some(max_threshold) = self.adaptive_packet_threshold_max {
                 let required = u32::try_from(spurious.max_packet_reordering.saturating_add(1))
@@ -1536,6 +1564,18 @@ impl Connection {
                 if target > self.packet_threshold {
                     self.packet_threshold = target;
                     self.stats.path.adaptive_packet_threshold_updates += 1;
+                }
+            }
+        }
+        if spurious.time_threshold != 0 {
+            if let Some(max_threshold) = self.adaptive_time_threshold_max {
+                // Keep 25% headroom above the confirmed late-ACK age and
+                // quantize to quarter-RTT steps to avoid noisy micro-updates.
+                let required = (time_ratio * 1.25 * 4.0).ceil() / 4.0;
+                let target = required.max(1.125).min(max_threshold);
+                if target > self.time_threshold {
+                    self.time_threshold = target;
+                    self.stats.path.adaptive_time_threshold_updates += 1;
                 }
             }
         }
@@ -1777,7 +1817,9 @@ impl Connection {
                     lost_packets.push(packet);
                     size_of_lost_packets += info.size as u64;
                     if packet_too_old {
-                        space.loss_history.record_time_threshold(packet);
+                        space
+                            .loss_history
+                            .record_time_threshold(packet, info.time_sent);
                         time_threshold_lost_packets += 1;
                     } else {
                         space.loss_history.record_packet_threshold(packet);

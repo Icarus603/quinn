@@ -667,7 +667,16 @@ impl Connection {
         conn.wake();
     }
 
-    /// Stop adapting the packet-number loss threshold.
+    /// Enable bounded packet- and time-threshold adaptation driven only by
+    /// confirmed spurious-loss evidence.
+    pub fn enable_adaptive_reordering(&self, max_packet_threshold: u32, max_time_threshold: f32) {
+        let mut conn = self.0.state.lock("enable_adaptive_reordering");
+        conn.inner
+            .enable_adaptive_reordering(max_packet_threshold, max_time_threshold);
+        conn.wake();
+    }
+
+    /// Stop adapting packet- and time-based loss thresholds.
     pub fn disable_adaptive_packet_reordering(&self) {
         let mut conn = self.0.state.lock("disable_adaptive_packet_reordering");
         conn.inner.disable_adaptive_packet_reordering();

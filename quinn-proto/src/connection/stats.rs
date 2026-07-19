@@ -160,6 +160,12 @@ pub struct PathStats {
     pub adaptive_packet_threshold_updates: u64,
     /// Largest confirmed packet-number reordering distance
     pub max_spurious_packet_reordering: u64,
+    /// Current RTT multiplier used by time-threshold loss detection
+    pub current_time_threshold: f32,
+    /// Number of times confirmed spurious loss raised the time threshold
+    pub adaptive_time_threshold_updates: u64,
+    /// Largest late-ACK packet age divided by the conservative RTT estimate
+    pub max_spurious_time_ratio: f32,
     /// The amount of packets sent on this path
     pub sent_packets: u64,
     /// The amount of PLPMTUD probe packets sent on this path (also counted by `sent_packets`)

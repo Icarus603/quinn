@@ -18,11 +18,13 @@ use crate::{
 /// Keep enough packet-number history to diagnose severe reordering without
 /// allowing a lossy peer to grow connection state without bound.
 const SPURIOUS_LOSS_TRACKING_WINDOW: u64 = 65_536;
+const TIME_LOSS_SAMPLE_LIMIT: usize = 256;
 
 #[derive(Debug, Default)]
 pub(super) struct LossHistory {
     packet_threshold: ArrayRangeSet,
     time_threshold: ArrayRangeSet,
+    time_samples: VecDeque<(u64, Instant)>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -32,6 +34,9 @@ pub(super) struct SpuriousLoss {
     /// Largest packet-number distance observed for a packet-threshold
     /// declaration that was later acknowledged.
     pub(super) max_packet_reordering: u64,
+    /// Longest observed age of a time-threshold loss when its late ACK
+    /// arrived. Sampled with a fixed memory bound.
+    pub(super) max_time_loss_age: Duration,
 }
 
 impl LossHistory {
@@ -40,15 +45,20 @@ impl LossHistory {
         self.packet_threshold.insert_one(packet);
     }
 
-    pub(super) fn record_time_threshold(&mut self, packet: u64) {
+    pub(super) fn record_time_threshold(&mut self, packet: u64, sent_at: Instant) {
         self.prune_before(packet);
         self.time_threshold.insert_one(packet);
+        self.time_samples.push_back((packet, sent_at));
+        while self.time_samples.len() > TIME_LOSS_SAMPLE_LIMIT {
+            self.time_samples.pop_front();
+        }
     }
 
     pub(super) fn take_acknowledged(
         &mut self,
         acknowledged: &ArrayRangeSet,
         largest_acked: u64,
+        now: Instant,
     ) -> SpuriousLoss {
         let packet_threshold = take_intersection(&mut self.packet_threshold, acknowledged);
         let time_threshold = take_intersection(&mut self.time_threshold, acknowledged);
@@ -56,6 +66,16 @@ impl LossHistory {
         let retain_from = largest_acked.saturating_sub(SPURIOUS_LOSS_TRACKING_WINDOW);
         self.packet_threshold.remove(0..retain_from);
         self.time_threshold.remove(0..retain_from);
+        let mut retained_samples = VecDeque::with_capacity(self.time_samples.len());
+        let mut max_time_loss_age = Duration::ZERO;
+        while let Some((packet, sent_at)) = self.time_samples.pop_front() {
+            if acknowledged.contains(packet) {
+                max_time_loss_age = max_time_loss_age.max(now.saturating_duration_since(sent_at));
+            } else if packet >= retain_from {
+                retained_samples.push_back((packet, sent_at));
+            }
+        }
+        self.time_samples = retained_samples;
 
         SpuriousLoss {
             packet_threshold: packet_threshold.count,
@@ -63,6 +83,7 @@ impl LossHistory {
             max_packet_reordering: packet_threshold
                 .earliest
                 .map_or(0, |packet| largest_acked.saturating_sub(packet)),
+            max_time_loss_age,
         }
     }
 
@@ -70,6 +91,8 @@ impl LossHistory {
         let retain_from = packet.saturating_sub(SPURIOUS_LOSS_TRACKING_WINDOW);
         self.packet_threshold.remove(0..retain_from);
         self.time_threshold.remove(0..retain_from);
+        self.time_samples
+            .retain(|(sampled_packet, _)| *sampled_packet >= retain_from);
     }
 }
 
@@ -1188,24 +1211,26 @@ mod test {
     #[test]
     fn loss_history_attributes_spurious_ack_by_trigger_once() {
         let mut history = LossHistory::default();
+        let now = Instant::now();
         history.record_packet_threshold(10);
         history.record_packet_threshold(11);
-        history.record_time_threshold(20);
+        history.record_time_threshold(20, now - Duration::from_millis(25));
 
         let mut acknowledged = ArrayRangeSet::new();
         acknowledged.insert(9..12);
         acknowledged.insert(20..21);
 
         assert_eq!(
-            history.take_acknowledged(&acknowledged, 20),
+            history.take_acknowledged(&acknowledged, 20, now),
             SpuriousLoss {
                 packet_threshold: 2,
                 time_threshold: 1,
                 max_packet_reordering: 10,
+                max_time_loss_age: Duration::from_millis(25),
             }
         );
         assert_eq!(
-            history.take_acknowledged(&acknowledged, 20),
+            history.take_acknowledged(&acknowledged, 20, now),
             SpuriousLoss::default(),
             "a repeated ACK must not double-count a spurious declaration"
         );
@@ -1214,8 +1239,9 @@ mod test {
     #[test]
     fn loss_history_prunes_packets_outside_bounded_window() {
         let mut history = LossHistory::default();
+        let now = Instant::now();
         history.record_packet_threshold(1);
-        history.record_time_threshold(SPURIOUS_LOSS_TRACKING_WINDOW + 2);
+        history.record_time_threshold(SPURIOUS_LOSS_TRACKING_WINDOW + 2, now);
         assert!(
             !history.packet_threshold.contains(1),
             "recording new loss must enforce the bound even before another ACK"
@@ -1223,14 +1249,14 @@ mod test {
 
         let acknowledged = ArrayRangeSet::new();
         assert_eq!(
-            history.take_acknowledged(&acknowledged, SPURIOUS_LOSS_TRACKING_WINDOW + 2),
+            history.take_acknowledged(&acknowledged, SPURIOUS_LOSS_TRACKING_WINDOW + 2, now,),
             SpuriousLoss::default()
         );
 
         let mut stale_ack = ArrayRangeSet::new();
         stale_ack.insert(1..2);
         assert_eq!(
-            history.take_acknowledged(&stale_ack, SPURIOUS_LOSS_TRACKING_WINDOW + 2),
+            history.take_acknowledged(&stale_ack, SPURIOUS_LOSS_TRACKING_WINDOW + 2, now),
             SpuriousLoss::default(),
             "loss history older than the fixed packet window must be discarded"
         );
@@ -1238,11 +1264,12 @@ mod test {
         let mut fresh_ack = ArrayRangeSet::new();
         fresh_ack.insert(SPURIOUS_LOSS_TRACKING_WINDOW + 2..SPURIOUS_LOSS_TRACKING_WINDOW + 3);
         assert_eq!(
-            history.take_acknowledged(&fresh_ack, SPURIOUS_LOSS_TRACKING_WINDOW + 2),
+            history.take_acknowledged(&fresh_ack, SPURIOUS_LOSS_TRACKING_WINDOW + 2, now),
             SpuriousLoss {
                 packet_threshold: 0,
                 time_threshold: 1,
                 max_packet_reordering: 0,
+                max_time_loss_age: Duration::ZERO,
             }
         );
     }
