@@ -9,7 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use crate::range_set::RangeSet;
 
 /// Helper to assemble unordered stream frames into an ordered stream
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Assembler {
     state: State,
     data: BinaryHeap<Buffer>,
@@ -22,6 +22,25 @@ pub(super) struct Assembler {
     /// aka the stream offset.
     bytes_read: u64,
     end: u64,
+    /// Maximum number of discontiguous buffers retained after defragmenting.
+    /// This is deliberately connection-controlled so authenticated protocols
+    /// can tolerate severe path reordering without relaxing the pre-auth DoS
+    /// bound.
+    max_chunks: usize,
+}
+
+impl Default for Assembler {
+    fn default() -> Self {
+        Self {
+            state: State::default(),
+            data: BinaryHeap::new(),
+            buffered: 0,
+            allocated: 0,
+            bytes_read: 0,
+            end: 0,
+            max_chunks: 1024,
+        }
+    }
 }
 
 impl Assembler {
@@ -32,9 +51,15 @@ impl Assembler {
     /// Reset to the initial state
     pub(super) fn reinit(&mut self) {
         let old_data = mem::take(&mut self.data);
+        let max_chunks = self.max_chunks;
         *self = Self::default();
         self.data = old_data;
         self.data.clear();
+        self.max_chunks = max_chunks;
+    }
+
+    pub(super) fn set_max_chunks(&mut self, max_chunks: usize) {
+        self.max_chunks = max_chunks;
     }
 
     pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
@@ -211,7 +236,7 @@ impl Assembler {
         if over_allocation > threshold {
             self.defragment();
             // ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?
-            if self.data.len() > 1024 {
+            if self.data.len() > self.max_chunks {
                 return Err(TooManyChunks);
             }
         }
@@ -369,6 +394,27 @@ mod test {
         assert_matches!(next(&mut x, 32), Some(ref y) if &y[..] == b"789");
         assert_matches!(next(&mut x, 32), Some(ref y) if &y[..] == b"10");
         assert_matches!(next(&mut x, 32), None);
+    }
+
+    #[test]
+    fn authenticated_chunk_limit_can_be_raised_without_removing_the_bound() {
+        let mut x = Assembler::new();
+        x.set_max_chunks(2);
+        x.insert(1, Bytes::from_static(b"a"), 65_536).unwrap();
+        x.insert(3, Bytes::from_static(b"b"), 65_536).unwrap();
+        assert!(x.insert(5, Bytes::from_static(b"c"), 65_536).is_err());
+
+        let mut tolerant = Assembler::new();
+        tolerant.set_max_chunks(3);
+        tolerant
+            .insert(1, Bytes::from_static(b"a"), 65_536)
+            .unwrap();
+        tolerant
+            .insert(3, Bytes::from_static(b"b"), 65_536)
+            .unwrap();
+        tolerant
+            .insert(5, Bytes::from_static(b"c"), 65_536)
+            .unwrap();
     }
 
     #[test]

@@ -129,6 +129,8 @@ pub struct StreamsState {
     pub(super) send_window: u64,
     /// Configured upper bound for how much unacked data the peer can send us per stream
     pub(super) stream_receive_window: u64,
+    /// Maximum number of discontiguous receive buffers retained per stream.
+    max_receive_chunks: usize,
 
     // Pertinent state from the TransportParameters supplied by the peer
     initial_max_stream_data_uni: VarInt,
@@ -177,6 +179,7 @@ impl StreamsState {
             unacked_data: 0,
             send_window,
             stream_receive_window: stream_receive_window.into(),
+            max_receive_chunks: 1024,
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
@@ -260,6 +263,7 @@ impl StreamsState {
             debug!("received illegal STREAM frame");
         })?;
 
+        let max_receive_chunks = self.max_receive_chunks;
         let rs = match self
             .recv
             .get_mut(&id)
@@ -277,6 +281,7 @@ impl StreamsState {
             return Ok(ShouldTransmit(false));
         }
 
+        rs.assembler.set_max_chunks(max_receive_chunks);
         let (new_bytes, closed) =
             rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data)?;
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
@@ -861,6 +866,10 @@ impl StreamsState {
 
     pub(crate) fn set_send_window(&mut self, send_window: u64) {
         self.send_window = send_window;
+    }
+
+    pub(crate) fn set_max_receive_chunks(&mut self, max_receive_chunks: usize) {
+        self.max_receive_chunks = max_receive_chunks;
     }
 
     /// Set the receive_window and returns whether the receive_window has been

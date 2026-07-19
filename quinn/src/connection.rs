@@ -644,6 +644,17 @@ impl Connection {
         conn.wake();
     }
 
+    /// Set the per-stream limit for discontiguous receive buffers.
+    ///
+    /// Keep the default before application authentication. Authenticated
+    /// protocols may raise this to tolerate severe path reordering while
+    /// retaining a finite memory bound.
+    pub fn set_max_stream_receive_chunks(&self, max_receive_chunks: usize) {
+        let mut conn = self.0.state.lock("set_max_stream_receive_chunks");
+        conn.inner.set_max_stream_receive_chunks(max_receive_chunks);
+        conn.wake();
+    }
+
     /// Update this connection's local packet- and time-threshold loss
     /// detection without rebuilding the QUIC carrier.
     ///

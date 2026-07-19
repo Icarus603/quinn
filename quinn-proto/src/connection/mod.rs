@@ -1448,6 +1448,16 @@ impl Connection {
         }
     }
 
+    /// Set the per-stream limit for discontiguous receive buffers.
+    ///
+    /// The default is 1024. Raising this after application authentication can
+    /// tolerate severe network reordering while preserving the tighter
+    /// pre-authentication memory-DoS bound.
+    pub fn set_max_stream_receive_chunks(&mut self, max_receive_chunks: usize) {
+        assert!((1..=16_384).contains(&max_receive_chunks));
+        self.streams.set_max_receive_chunks(max_receive_chunks);
+    }
+
     /// Update this connection's local packet- and time-threshold loss
     /// detection without rebuilding the QUIC carrier.
     ///
