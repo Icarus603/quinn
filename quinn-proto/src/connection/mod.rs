@@ -136,6 +136,9 @@ pub struct Connection {
     /// Runtime packet-number reordering tolerance. Initialized from
     /// `config`, but independently mutable for path-adaptive recovery.
     packet_threshold: u32,
+    /// Upper bound for confirmed-spurious-loss adaptation. `None` keeps
+    /// recovery fully static.
+    adaptive_packet_threshold_max: Option<u32>,
     /// Runtime time-based reordering tolerance. Initialized from
     /// `config`, but independently mutable for path-adaptive recovery.
     time_threshold: f32,
@@ -280,6 +283,7 @@ impl Connection {
         let mut this = Self {
             endpoint_config,
             packet_threshold: config.packet_threshold,
+            adaptive_packet_threshold_max: None,
             time_threshold: config.time_threshold,
             crypto,
             handshake_cid: loc_cid,
@@ -1273,6 +1277,7 @@ impl Connection {
         stats.path.rtt = self.path.rtt.get();
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
+        stats.path.current_packet_threshold = self.packet_threshold;
 
         stats
     }
@@ -1402,6 +1407,8 @@ impl Connection {
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
         self.path.reset(now, &self.config);
+        self.packet_threshold = self.config.packet_threshold;
+        self.time_threshold = self.config.time_threshold;
     }
 
     /// Modify the number of remotely initiated streams that may be concurrently open
@@ -1451,6 +1458,23 @@ impl Connection {
         self.time_threshold = time_threshold;
     }
 
+    /// Grow the packet-number loss threshold only after a packet previously
+    /// declared lost is subsequently acknowledged.
+    ///
+    /// Adaptation is monotonic on the current path, bounded by
+    /// `max_packet_threshold`, and never changes the time threshold. The
+    /// caller must use a maximum in `3..=16384`.
+    pub fn enable_adaptive_packet_reordering(&mut self, max_packet_threshold: u32) {
+        assert!((3..=16_384).contains(&max_packet_threshold));
+        self.adaptive_packet_threshold_max = Some(max_packet_threshold);
+    }
+
+    /// Stop adapting the packet-number threshold. The current thresholds are
+    /// preserved until explicitly changed.
+    pub fn disable_adaptive_packet_reordering(&mut self) {
+        self.adaptive_packet_threshold_max = None;
+    }
+
     fn on_ack_received(
         &mut self,
         now: Instant,
@@ -1494,6 +1518,27 @@ impl Connection {
         self.stats.path.spurious_time_threshold_lost_packets += spurious.time_threshold;
         self.stats.path.spurious_lost_packets +=
             spurious.packet_threshold + spurious.time_threshold;
+        self.stats.path.max_spurious_packet_reordering = self
+            .stats
+            .path
+            .max_spurious_packet_reordering
+            .max(spurious.max_packet_reordering);
+        if spurious.packet_threshold != 0 {
+            if let Some(max_threshold) = self.adaptive_packet_threshold_max {
+                let required = u32::try_from(spurious.max_packet_reordering.saturating_add(1))
+                    .unwrap_or(max_threshold)
+                    .min(max_threshold);
+                let target = required
+                    .max(3)
+                    .checked_next_power_of_two()
+                    .unwrap_or(max_threshold)
+                    .min(max_threshold);
+                if target > self.packet_threshold {
+                    self.packet_threshold = target;
+                    self.stats.path.adaptive_packet_threshold_updates += 1;
+                }
+            }
+        }
 
         if newly_acked.is_empty() {
             return Ok(());
@@ -3096,6 +3141,8 @@ impl Connection {
         let mut new_path = if remote.is_ipv4() && remote.ip() == self.path.remote.ip() {
             PathData::from_previous(remote, &self.path, self.path_counter, now)
         } else {
+            self.packet_threshold = self.config.packet_threshold;
+            self.time_threshold = self.config.time_threshold;
             let peer_max_udp_payload_size =
                 u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
                     .unwrap_or(u16::MAX);

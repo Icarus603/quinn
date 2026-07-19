@@ -29,6 +29,9 @@ pub(super) struct LossHistory {
 pub(super) struct SpuriousLoss {
     pub(super) packet_threshold: u64,
     pub(super) time_threshold: u64,
+    /// Largest packet-number distance observed for a packet-threshold
+    /// declaration that was later acknowledged.
+    pub(super) max_packet_reordering: u64,
 }
 
 impl LossHistory {
@@ -55,8 +58,11 @@ impl LossHistory {
         self.time_threshold.remove(0..retain_from);
 
         SpuriousLoss {
-            packet_threshold,
-            time_threshold,
+            packet_threshold: packet_threshold.count,
+            time_threshold: time_threshold.count,
+            max_packet_reordering: packet_threshold
+                .earliest
+                .map_or(0, |packet| largest_acked.saturating_sub(packet)),
         }
     }
 
@@ -67,7 +73,13 @@ impl LossHistory {
     }
 }
 
-fn take_intersection(history: &mut ArrayRangeSet, acknowledged: &ArrayRangeSet) -> u64 {
+#[derive(Debug, Default)]
+struct Intersection {
+    count: u64,
+    earliest: Option<u64>,
+}
+
+fn take_intersection(history: &mut ArrayRangeSet, acknowledged: &ArrayRangeSet) -> Intersection {
     let mut overlap = ArrayRangeSet::new();
     let mut history_ranges = history.iter();
     let mut acknowledged_ranges = acknowledged.iter();
@@ -95,8 +107,9 @@ fn take_intersection(history: &mut ArrayRangeSet, acknowledged: &ArrayRangeSet) 
     drop(history_ranges);
     drop(acknowledged_ranges);
     let count = overlap.iter().map(|range| range.end - range.start).sum();
+    let earliest = overlap.min();
     history.subtract(&overlap);
-    count
+    Intersection { count, earliest }
 }
 
 pub(super) struct PacketSpace {
@@ -1188,6 +1201,7 @@ mod test {
             SpuriousLoss {
                 packet_threshold: 2,
                 time_threshold: 1,
+                max_packet_reordering: 10,
             }
         );
         assert_eq!(
@@ -1228,6 +1242,7 @@ mod test {
             SpuriousLoss {
                 packet_threshold: 0,
                 time_threshold: 1,
+                max_packet_reordering: 0,
             }
         );
     }

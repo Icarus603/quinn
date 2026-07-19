@@ -658,6 +658,22 @@ impl Connection {
         conn.wake();
     }
 
+    /// Grow the local packet-number loss threshold only from confirmed
+    /// spurious-loss evidence, up to `max_packet_threshold`.
+    pub fn enable_adaptive_packet_reordering(&self, max_packet_threshold: u32) {
+        let mut conn = self.0.state.lock("enable_adaptive_packet_reordering");
+        conn.inner
+            .enable_adaptive_packet_reordering(max_packet_threshold);
+        conn.wake();
+    }
+
+    /// Stop adapting the packet-number loss threshold.
+    pub fn disable_adaptive_packet_reordering(&self) {
+        let mut conn = self.0.state.lock("disable_adaptive_packet_reordering");
+        conn.inner.disable_adaptive_packet_reordering();
+        conn.wake();
+    }
+
     /// Modify the number of remotely initiated bidirectional streams that may be concurrently open
     ///
     /// No streams may be opened by the peer unless fewer than `count` are already open. Large

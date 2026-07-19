@@ -154,6 +154,12 @@ pub struct PathStats {
     pub spurious_packet_threshold_lost_packets: u64,
     /// Time-threshold losses that were subsequently acknowledged
     pub spurious_time_threshold_lost_packets: u64,
+    /// Current packet-number threshold used by loss detection
+    pub current_packet_threshold: u32,
+    /// Number of times confirmed spurious loss raised the packet threshold
+    pub adaptive_packet_threshold_updates: u64,
+    /// Largest confirmed packet-number reordering distance
+    pub max_spurious_packet_reordering: u64,
     /// The amount of packets sent on this path
     pub sent_packets: u64,
     /// The amount of PLPMTUD probe packets sent on this path (also counted by `sent_packets`)

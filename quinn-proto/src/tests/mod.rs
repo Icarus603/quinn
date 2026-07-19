@@ -1714,6 +1714,8 @@ fn late_ack_attributes_packet_threshold_spurious_loss() {
     let _guard = subscribe();
     let mut pair = Pair::default_with_deterministic_pns();
     let (client_ch, server_ch) = pair.connect();
+    pair.client_conn_mut(client_ch)
+        .enable_adaptive_packet_reordering(64);
 
     let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     pair.client_send(client_ch, stream)
@@ -1742,6 +1744,8 @@ fn late_ack_attributes_packet_threshold_spurious_loss() {
     assert!(after_loss.packet_threshold_lost_packets > 0);
     assert_eq!(after_loss.time_threshold_lost_packets, 0);
     assert_eq!(after_loss.spurious_lost_packets, 0);
+    assert_eq!(after_loss.current_packet_threshold, 3);
+    assert_eq!(after_loss.adaptive_packet_threshold_updates, 0);
 
     // The original packet was delayed, not dropped. Delivering it now
     // produces an ACK for a packet no longer present in sent_packets,
@@ -1758,10 +1762,24 @@ fn late_ack_attributes_packet_threshold_spurious_loss() {
         final_stats.spurious_lost_packets,
         final_stats.spurious_packet_threshold_lost_packets
     );
+    assert!(final_stats.current_packet_threshold > 3);
+    assert_eq!(final_stats.adaptive_packet_threshold_updates, 1);
+    assert!(final_stats.max_spurious_packet_reordering >= 3);
 
     // The retransmission still delivered the complete application data.
     let received = stream_chunks(pair.server_recv(server_ch, stream));
     assert_eq!(received, vec![0x5a; DEFAULT_MTU * 8]);
+
+    let now = pair.time;
+    pair.client_conn_mut(client_ch).path_changed(now);
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .path
+            .current_packet_threshold,
+        3,
+        "a changed path must restart from the configured recovery threshold"
+    );
 }
 
 #[test]
